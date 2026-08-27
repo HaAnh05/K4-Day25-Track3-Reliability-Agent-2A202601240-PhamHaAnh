@@ -142,12 +142,14 @@ class ResponseCache:
 
 
 # ---------------------------------------------------------------------------
-# Redis shared cache
+# Redis shared cache with Graceful In-Memory Degradation (Bonus)
 # ---------------------------------------------------------------------------
 
 
 class SharedRedisCache:
     """Redis-backed shared cache for multi-instance deployments.
+
+    Includes graceful degradation to in-memory cache if Redis is offline (Bonus).
 
     Data model:
         Key    = "{prefix}{query_hash}"   (Redis namespace)
@@ -165,89 +167,110 @@ class SharedRedisCache:
         similarity_threshold: float,
         prefix: str = "rl:cache:",
     ):
-        import redis as redis_lib
-
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self.prefix = prefix
         self.false_hit_log: list[dict[str, object]] = []
-        self._redis: Any = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        self._fallback_cache = ResponseCache(ttl_seconds, similarity_threshold)
+        self._redis: Any = None
+        try:
+            import redis as redis_lib
+            self._redis = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        except Exception:
+            self._redis = None
 
     def ping(self) -> bool:
         """Check Redis connectivity."""
+        if self._redis is None:
+            return False
         try:
             return bool(self._redis.ping())
         except Exception:
             return False
 
     def get(self, query: str) -> tuple[str | None, float]:
-        """Look up a cached response from Redis.
-
-        1. Return (None, 0.0) if _is_uncacheable(query)
-        2. Build exact-match key and try hget — if found return (response, 1.0)
-        3. Otherwise scan all keys and find best similarity match
-        4. Apply false-hit check before returning
-        """
+        """Look up a cached response from Redis, with graceful fallback to memory."""
         if _is_uncacheable(query):
             return None, 0.0
 
-        # Exact match first
-        exact_key = f"{self.prefix}{self._query_hash(query)}"
-        response = self._redis.hget(exact_key, "response")
-        if response:
-            return response, 1.0
+        try:
+            if self._redis is not None and self.ping():
+                # Exact match first
+                exact_key = f"{self.prefix}{self._query_hash(query)}"
+                response = self._redis.hget(exact_key, "response")
+                if response:
+                    return response, 1.0
 
-        # Similarity scan
-        best_score = 0.0
-        best_response: str | None = None
-        best_cached_query: str | None = None
+                # Similarity scan
+                best_score = 0.0
+                best_response: str | None = None
+                best_cached_query: str | None = None
 
-        for k in self._redis.scan_iter(f"{self.prefix}*"):
-            cached_query = self._redis.hget(k, "query")
-            if cached_query is None:
-                continue
-            score = ResponseCache.similarity(query, cached_query)
-            if score > best_score:
-                best_score = score
-                best_response = self._redis.hget(k, "response")
-                best_cached_query = cached_query
+                for k in self._redis.scan_iter(f"{self.prefix}*"):
+                    cached_query = self._redis.hget(k, "query")
+                    if cached_query is None:
+                        continue
+                    score = ResponseCache.similarity(query, cached_query)
+                    if score > best_score:
+                        best_score = score
+                        best_response = self._redis.hget(k, "response")
+                        best_cached_query = cached_query
 
-        if best_response is not None and best_score >= self.similarity_threshold:
-            if _looks_like_false_hit(query, best_cached_query or ""):
-                self.false_hit_log.append({
-                    "query": query,
-                    "cached_key": best_cached_query,
-                    "score": best_score,
-                    "reason": "date_or_number_mismatch",
-                })
+                if best_response is not None and best_score >= self.similarity_threshold:
+                    if _looks_like_false_hit(query, best_cached_query or ""):
+                        self.false_hit_log.append({
+                            "query": query,
+                            "cached_key": best_cached_query,
+                            "score": best_score,
+                            "reason": "date_or_number_mismatch",
+                        })
+                        return None, best_score
+                    return best_response, best_score
+
                 return None, best_score
-            return best_response, best_score
+        except Exception:
+            pass
 
-        return None, best_score
+        # Graceful degradation to in-memory fallback cache
+        res, score = self._fallback_cache.get(query)
+        self.false_hit_log = self._fallback_cache.false_hit_log
+        return res, score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
-        """Store a response in Redis with TTL.
-
-        1. Return immediately if _is_uncacheable(query)
-        2. Build key: f"{self.prefix}{self._query_hash(query)}"
-        3. hset with mapping {"query": query, "response": value}
-        4. expire with self.ttl_seconds
-        """
+        """Store a response in Redis with TTL, with fallback to in-memory cache."""
         if _is_uncacheable(query):
             return
-        key = f"{self.prefix}{self._query_hash(query)}"
-        self._redis.hset(key, mapping={"query": query, "response": value})
-        self._redis.expire(key, self.ttl_seconds)
+
+        try:
+            if self._redis is not None and self.ping():
+                key = f"{self.prefix}{self._query_hash(query)}"
+                self._redis.hset(key, mapping={"query": query, "response": value})
+                self._redis.expire(key, self.ttl_seconds)
+                return
+        except Exception:
+            pass
+
+        # Fallback to in-memory cache
+        self._fallback_cache.set(query, value, metadata)
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
-        for key in self._redis.scan_iter(f"{self.prefix}*"):
-            self._redis.delete(key)
+        try:
+            if self._redis is not None and self.ping():
+                for key in self._redis.scan_iter(f"{self.prefix}*"):
+                    self._redis.delete(key)
+        except Exception:
+            pass
+        self._fallback_cache = ResponseCache(self.ttl_seconds, self.similarity_threshold)
+        self.false_hit_log = []
 
     def close(self) -> None:
         """Close Redis connection."""
         if self._redis is not None:
-            self._redis.close()
+            try:
+                self._redis.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _query_hash(query: str) -> str:

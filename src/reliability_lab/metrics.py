@@ -43,6 +43,46 @@ class RunMetrics(BaseModel):
     def percentile(self, q: float) -> float:
         return percentile(self.latencies_ms, q)
 
+    def check_slos(
+        self,
+        min_availability: float = 0.99,
+        max_latency_p95_ms: float = 2500.0,
+        min_fallback_success_rate: float = 0.95,
+        min_cache_hit_rate: float = 0.10,
+        max_recovery_time_ms: float = 5000.0,
+    ) -> dict[str, dict[str, object]]:
+        """Evaluate metrics against standard production SLO targets (Bonus feature)."""
+        recovery_ok = (
+            self.recovery_time_ms is None or self.recovery_time_ms <= max_recovery_time_ms
+        )
+        return {
+            "availability": {
+                "target": f">={min_availability*100:.1f}%",
+                "actual": f"{self.availability*100:.2f}%",
+                "met": self.availability >= min_availability,
+            },
+            "latency_p95": {
+                "target": f"<{max_latency_p95_ms}ms",
+                "actual": f"{self.percentile(95):.2f}ms",
+                "met": self.percentile(95) < max_latency_p95_ms,
+            },
+            "fallback_success_rate": {
+                "target": f">={min_fallback_success_rate*100:.1f}%",
+                "actual": f"{self.fallback_success_rate*100:.2f}%",
+                "met": self.fallback_success_rate >= min_fallback_success_rate,
+            },
+            "cache_hit_rate": {
+                "target": f">={min_cache_hit_rate*100:.1f}%",
+                "actual": f"{self.cache_hit_rate*100:.2f}%",
+                "met": self.cache_hit_rate >= min_cache_hit_rate,
+            },
+            "recovery_time": {
+                "target": f"<{max_recovery_time_ms}ms",
+                "actual": f"{self.recovery_time_ms:.2f}ms" if self.recovery_time_ms is not None else "N/A",
+                "met": recovery_ok,
+            },
+        }
+
     def to_report_dict(self) -> dict[str, object]:
         return {
             "total_requests": self.total_requests,

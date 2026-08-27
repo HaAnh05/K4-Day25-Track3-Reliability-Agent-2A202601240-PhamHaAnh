@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
@@ -69,41 +71,51 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     return sum(recovery_times) / len(recovery_times) if recovery_times else None
 
 
-def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
+def run_scenario(
+    config: LabConfig,
+    queries: list[str],
+    scenario: ScenarioConfig,
+    concurrency: int = 1,
+) -> RunMetrics:
     """Run a single named chaos scenario and collect metrics.
 
-    1. Build gateway with provider overrides from scenario
-    2. Loop config.load_test.requests times
-    3. Collect: total, success/fail, cache hits, fallback counts, latencies, cost
-    4. Count circuit open transitions
-    5. Calculate recovery time
+    Supports concurrent load simulation via ThreadPoolExecutor (Bonus feature).
     """
     gateway = build_gateway(config, scenario.provider_overrides or None)
     metrics = RunMetrics()
+    lock = threading.Lock()
 
-    for _ in range(config.load_test.requests):
+    def send_one_request() -> None:
         prompt = random.choice(queries)
         result = gateway.complete(prompt)
 
-        metrics.total_requests += 1
-        metrics.estimated_cost += result.estimated_cost
+        with lock:
+            metrics.total_requests += 1
+            metrics.estimated_cost += result.estimated_cost
 
-        if result.cache_hit:
-            metrics.cache_hits += 1
-            metrics.estimated_cost_saved += 0.001
-            metrics.successful_requests += 1
-        elif result.route == "static_fallback":
-            metrics.static_fallbacks += 1
-            metrics.failed_requests += 1
-        elif result.route == "fallback":
-            metrics.fallback_successes += 1
-            metrics.successful_requests += 1
-        else:
-            # primary or cache_hit route
-            metrics.successful_requests += 1
+            if result.cache_hit:
+                metrics.cache_hits += 1
+                metrics.estimated_cost_saved += 0.001
+                metrics.successful_requests += 1
+            elif result.route == "static_fallback":
+                metrics.static_fallbacks += 1
+                metrics.failed_requests += 1
+            elif result.route == "fallback":
+                metrics.fallback_successes += 1
+                metrics.successful_requests += 1
+            else:
+                # primary or other route
+                metrics.successful_requests += 1
 
-        if result.latency_ms > 0:
-            metrics.latencies_ms.append(result.latency_ms)
+            if result.latency_ms > 0:
+                metrics.latencies_ms.append(result.latency_ms)
+
+    if concurrency > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            list(executor.map(lambda _: send_one_request(), range(config.load_test.requests)))
+    else:
+        for _ in range(config.load_test.requests):
+            send_one_request()
 
     # Count circuit open transitions across all breakers
     metrics.circuit_open_count = sum(
@@ -117,20 +129,20 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     return metrics
 
 
-def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
+def run_simulation(config: LabConfig, queries: list[str], concurrency: int = 1) -> RunMetrics:
     """Run all named scenarios from config, or a default run if none defined.
 
-    Includes a cache vs no-cache comparison scenario.
+    Includes a cache vs no-cache comparison scenario and concurrent execution support.
     """
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
-        metrics = run_scenario(config, queries, default_scenario)
+        metrics = run_scenario(config, queries, default_scenario, concurrency=concurrency)
         metrics.scenarios = {"default": "pass" if metrics.successful_requests > 0 else "fail"}
         return metrics
 
     combined = RunMetrics()
     for scenario in config.scenarios:
-        result = run_scenario(config, queries, scenario)
+        result = run_scenario(config, queries, scenario, concurrency=concurrency)
 
         # Define pass/fail criteria per scenario
         if scenario.name == "primary_timeout_100":
